@@ -36,21 +36,22 @@ players_bp = Blueprint("players", __name__)
 @players_bp.route("/api/players")
 def get_players():
     try:
+        # ── Query params ──────────────────────────────────────────────────────
         birth_year      = request.args.get("birthYear")
         birth_year_from = request.args.get("birthYearFrom")
         birth_year_to   = request.args.get("birthYearTo")
         season          = request.args.get("season")
-        league     = request.args.get("league")
-        position   = request.args.get("position")
-        search     = request.args.get("search", "").strip()
-        page       = int(request.args.get("page", 0))
-        page_size  = int(request.args.get("pageSize", 50))
-        sort_by    = request.args.get("sortBy", "player_name")
-        sort_dir   = 1 if request.args.get("sortDir", "asc") == "asc" else -1
+        league          = request.args.get("league")
+        position        = request.args.get("position")
+        search          = request.args.get("search", "").strip()
+        page            = max(0, int(request.args.get("page", 0)))
+        page_size       = min(200, max(1, int(request.args.get("pageSize", 50))))
+        sort_by         = request.args.get("sortBy", "player_name")
+        sort_dir        = 1 if request.args.get("sortDir", "asc") == "asc" else -1
 
-        stats_collection = db["stats"]
+        stats_col = db["stats"]
 
-        # 1. Base query construction
+        # ── 1. Base $match (stats-level fields only, hits indexes early) ──────
         base_match = {}
         if season:   base_match["season"]   = season
         if league:   base_match["league"]   = league
@@ -61,255 +62,259 @@ def get_players():
                 {"team":        {"$regex": search, "$options": "i"}},
             ]
 
-        pipeline = [{"$match": base_match}] if base_match else []
-
-        # 2. Join with players bio
-        pipeline += [
+        # ── 2. Lookup + bio fields ────────────────────────────────────────────
+        LOOKUP_STAGES = [
             {
                 "$lookup": {
-                    "from": "players",
-                    "localField": "player_url",
+                    "from":         "players",
+                    "localField":   "player_url",
                     "foreignField": "url",
-                    "as": "bio"
-                }
+                    "as":           "bio",
+                },
             },
             {"$unwind": {"path": "$bio", "preserveNullAndEmptyArrays": True}},
             {
                 "$addFields": {
+                    # Extract birth year as int once; reuse everywhere below
                     "birthYearRaw": {
-                        "$toInt": {
-                            "$substr": [
-                                {"$ifNull": ["$bio.birthDate", "0000-00-00"]}, 0, 4
-                            ]
+                        "$convert": {
+                            "input": {
+                                "$substr": [
+                                    {"$ifNull": ["$bio.birthDate", "0000-00-00"]}, 0, 4
+                                ]
+                            },
+                            "to":      "int",
+                            "onError": 0,
+                            "onNull":  0,
                         }
                     },
                     "birthDate":   "$bio.birthDate",
                     "birthPlace":  "$bio.birthPlace",
-                    "birthState":  {
+                    "birthState": {
                         "$ifNull": [
                             {"$getField": {
                                 "field": "addressRegion",
                                 "input": {"$getField": {
                                     "field": "address",
-                                    "input": "$bio.birthPlace"
-                                }}
+                                    "input": "$bio.birthPlace",
+                                }},
                             }},
-                            ""
+                            "",
                         ]
                     },
                     "nationality": "$bio.nationality",
                     "knowsAbout":  "$bio.knowsAbout",
-                }
+                },
             },
             {
                 "$addFields": {
                     "birthYear": {
                         "$cond": {
-                            "if": {"$or": [
-                                {"$eq": ["$birthYearRaw", 0]},
-                                {"$eq": ["$birthYearRaw", None]}
-                            ]},
+                            "if":   {"$lte": ["$birthYearRaw", 0]},
                             "then": "N/A",
-                            "else": "$birthYearRaw"
+                            "else": "$birthYearRaw",
                         }
                     }
                 }
-            }
+            },
         ]
 
-        # 3. Birth year post-filter (supports exact year or from/to range)
-        by_filter = {}
+        # ── 3. Optional birth-year filter ─────────────────────────────────────
+        birth_year_match = {}
         if birth_year_from or birth_year_to:
             try:
                 if birth_year_from:
-                    by_filter["$gte"] = int(birth_year_from)
+                    birth_year_match["$gte"] = int(birth_year_from)
                 if birth_year_to:
-                    by_filter["$lte"] = int(birth_year_to)
-                pipeline.append({"$match": {"birthYearRaw": by_filter}})
+                    birth_year_match["$lte"] = int(birth_year_to)
             except ValueError:
                 pass
         elif birth_year:
             try:
-                pipeline.append({"$match": {"birthYearRaw": int(birth_year)}})
+                birth_year_match = int(birth_year)          # exact int match
             except ValueError:
                 if birth_year.upper() == "N/A":
-                    pipeline.append({"$match": {"birthYear": "N/A"}})
+                    birth_year_match = "N/A"                # matched on birthYear string
 
-        # 4. Metrics aggregation
-        metrics = {
-            "totalPlayers": 0, "forwards": 0, "defensemen": 0, "goalies": 0,
-            "avgGP": 0, "avgGAA": 0, "avgSVP": 0, "maxPTS": 0, "leagueCount": 0,
-            "topForwardScorer": "—", "maxForwardPts": 0,
-            "topDefenseScorer": "—", "maxDefensePts": 0, "avgDefenseBlks": 0,
-            "topGoalie": "—", "maxGoalieSVP": 0, "topGoalieGAA": 0
-        }
+        # ── 4. Assemble shared pipeline (base match → lookup → birth filter) ──
+        pipeline: list = []
+        if base_match:
+            pipeline.append({"$match": base_match})
+        pipeline.extend(LOOKUP_STAGES)
+        if birth_year_match:
+            field = "birthYear" if birth_year_match == "N/A" else "birthYearRaw"
+            pipeline.append({"$match": {field: birth_year_match}})
 
-        _fwd_positions  = ["F", "LW", "RW", "C", "FORWARD", "F/D", "F-D"]
-        _def_positions  = ["D", "DEF", "DEFENSE", "DEFENSEMAN", "F/D", "F-D"]
-        _gk_positions   = ["G", "GK", "GOALIE"]
+        # ── 5. Position helper (used inside $group below) ─────────────────────
+        _FWD = ["F", "LW", "RW", "C", "FORWARD", "F/D", "F-D"]
+        _DEF = ["D", "DEF", "DEFENSE", "DEFENSEMAN", "F/D", "F-D"]
+        _GK  = ["G", "GK", "GOALIE"]
 
         def _pos_upper(field):
             return {"$toUpper": {"$ifNull": [field, ""]}}
 
-        metrics_pipeline = list(pipeline) + [
+        def _is_pos(positions):
+            return {"$in": [_pos_upper("$position"), positions]}
+
+        # ── 6. Single $facet: metrics + paginated rows in one round-trip ──────
+        #
+        #  Metrics use conditional $max / $avg instead of $push-ing every doc,
+        #  eliminating the O(n) in-memory array that the original built.
+        #
+        facet_pipeline = pipeline + [
             {
-                "$group": {
-                    "_id": None,
-                    "totalPlayers": {"$sum": 1},
-                    "forwards": {
-                        "$sum": {
-                            "$cond": [
-                                {"$or": [
-                                    {"$in": [_pos_upper("$position"),       _fwd_positions]},
-                                    {"$in": [_pos_upper("$stats.position"), _fwd_positions]}
-                                ]},
-                                1, 0
-                            ]
-                        }
-                    },
-                    "defensemen": {
-                        "$sum": {
-                            "$cond": [
-                                {"$or": [
-                                    {"$in": [_pos_upper("$position"),       _def_positions]},
-                                    {"$in": [_pos_upper("$stats.position"), _def_positions]}
-                                ]},
-                                1, 0
-                            ]
-                        }
-                    },
-                    "goalies": {
-                        "$sum": {
-                            "$cond": [
-                                {"$or": [
-                                    {"$in": [_pos_upper("$position"),       _gk_positions]},
-                                    {"$in": [_pos_upper("$stats.position"), _gk_positions]}
-                                ]},
-                                1, 0
-                            ]
-                        }
-                    },
-                    "avgGP":  {"$avg": "$stats.gp"},
-                    "avgGAA": {"$avg": {"$cond": [{"$gt": ["$stats.gaa",    0]}, "$stats.gaa",    "$$REMOVE"]}},
-                    "avgSVP": {"$avg": {"$cond": [{"$gt": ["$stats.sv_pct", 0]}, "$stats.sv_pct", "$$REMOVE"]}},
-                    "maxPTS": {"$max": "$stats.pts"},
-                    "leagues": {"$addToSet": "$league"},
-                    "all_players": {
-                        "$push": {
-                            "name":     "$player_name",
-                            "position": _pos_upper("$position"),
-                            "pts":      {"$ifNull": ["$stats.pts",    0]},
-                            "svp":      {"$ifNull": ["$stats.sv_pct", 0]},
-                            "gaa":      {"$ifNull": ["$stats.gaa",    0]}
-                        }
-                    },
-                    "avgDefenseBlks": {
-                        "$avg": {
-                            "$cond": [
-                                {"$in": [_pos_upper("$position"), ["D", "DEF"]]},
-                                "$stats.blocked_shots",
-                                "$$REMOVE"
-                            ]
-                        }
-                    }
-                }
-            },
-            {
-                "$project": {
-                    "_id": 0,
-                    "totalPlayers": 1, "forwards": 1, "defensemen": 1, "goalies": 1,
-                    "avgGP": 1, "avgGAA": 1, "avgSVP": 1, "maxPTS": 1,
-                    "avgDefenseBlks": {"$ifNull": ["$avgDefenseBlks", 0]},
-                    "leagueCount": {"$size": "$leagues"},
-                    "top_forwards": {
-                        "$sortArray": {
-                            "input": {"$filter": {
-                                "input": "$all_players", "as": "p",
-                                "cond": {"$in": ["$$p.position", ["F", "LW", "RW", "C", "FORWARD"]]}
-                            }},
-                            "sortBy": {"pts": -1}
-                        }
-                    },
-                    "top_defense": {
-                        "$sortArray": {
-                            "input": {"$filter": {
-                                "input": "$all_players", "as": "p",
-                                "cond": {"$in": ["$$p.position", ["D", "DEF", "DEFENSE", "DEFENSEMAN"]]}
-                            }},
-                            "sortBy": {"pts": -1}
-                        }
-                    },
-                    "top_goalies": {
-                        "$sortArray": {
-                            "input": {"$filter": {
-                                "input": "$all_players", "as": "p",
-                                "cond": {"$in": ["$$p.position", ["G", "GK", "GOALIE"]]}
-                            }},
-                            "sortBy": {"svp": -1}
-                        }
-                    }
-                }
-            },
-            {
-                "$project": {
-                    "totalPlayers": 1, "forwards": 1, "defensemen": 1, "goalies": 1,
-                    "avgGP": 1, "avgGAA": 1, "avgSVP": 1, "maxPTS": 1,
-                    "avgDefenseBlks": 1, "leagueCount": 1,
-                    "first_forward": {"$arrayElemAt": ["$top_forwards", 0]},
-                    "first_defense": {"$arrayElemAt": ["$top_defense",  0]},
-                    "first_goalie":  {"$arrayElemAt": ["$top_goalies",  0]}
+                "$facet": {
+                    # ── 6a. Metrics branch ────────────────────────────────────
+                    "metrics": [
+                        {
+                            "$group": {
+                                "_id": None,
+                                "totalPlayers": {"$sum": 1},
+                                "forwards":   {"$sum": {"$cond": [_is_pos(_FWD), 1, 0]}},
+                                "defensemen": {"$sum": {"$cond": [_is_pos(_DEF), 1, 0]}},
+                                "goalies":    {"$sum": {"$cond": [_is_pos(_GK),  1, 0]}},
+                                "avgGP":  {"$avg": "$stats.gp"},
+                                # Only average meaningful (> 0) values
+                                "avgGAA": {"$avg": {"$cond": [{"$gt": ["$stats.gaa",    0]}, "$stats.gaa",    "$$REMOVE"]}},
+                                "avgSVP": {"$avg": {"$cond": [{"$gt": ["$stats.sv_pct", 0]}, "$stats.sv_pct", "$$REMOVE"]}},
+                                "maxPTS": {"$max": "$stats.pts"},
+                                "leagues": {"$addToSet": "$league"},
+                                # Top forward: track name+pts together via $maxN workaround —
+                                # accumulate only forward rows, keep highest pts
+                                "fwdMaxPts": {
+                                    "$max": {
+                                        "$cond": [
+                                            _is_pos(_FWD),
+                                            "$stats.pts",
+                                            "$$REMOVE",
+                                        ]
+                                    }
+                                },
+                                "defMaxPts": {
+                                    "$max": {
+                                        "$cond": [
+                                            _is_pos(_DEF),
+                                            "$stats.pts",
+                                            "$$REMOVE",
+                                        ]
+                                    }
+                                },
+                                "gkMaxSVP": {
+                                    "$max": {
+                                        "$cond": [
+                                            _is_pos(_GK),
+                                            "$stats.sv_pct",
+                                            "$$REMOVE",
+                                        ]
+                                    }
+                                },
+                                "avgDefenseBlks": {
+                                    "$avg": {
+                                        "$cond": [
+                                            _is_pos(["D", "DEF"]),
+                                            "$stats.blocked_shots",
+                                            "$$REMOVE",
+                                        ]
+                                    }
+                                },
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "totalPlayers": 1,
+                                "forwards": 1, "defensemen": 1, "goalies": 1,
+                                "avgGP": 1, "avgGAA": 1, "avgSVP": 1,
+                                "maxPTS": 1, "avgDefenseBlks": 1,
+                                "leagueCount":  {"$size": {"$ifNull": ["$leagues", []]}},
+                                "fwdMaxPts": 1, "defMaxPts": 1, "gkMaxSVP": 1,
+                            }
+                        },
+                    ],
+
+                    # ── 6b. Top scorers: tiny secondary lookup for names only ─
+                    #   These are three small $sort+$limit passes on an already-
+                    #   filtered set — far cheaper than $push on every doc.
+                    "topForward": [
+                        {"$match": {
+                            "$expr": _is_pos(_FWD)
+                        }},
+                        {"$sort":  {"stats.pts": -1}},
+                        {"$limit": 1},
+                        {"$project": {"_id": 0, "player_name": 1, "stats.pts": 1}},
+                    ],
+                    "topDefense": [
+                        {"$match": {"$expr": _is_pos(_DEF)}},
+                        {"$sort":  {"stats.pts": -1}},
+                        {"$limit": 1},
+                        {"$project": {"_id": 0, "player_name": 1, "stats.pts": 1}},
+                    ],
+                    "topGoalie": [
+                        {"$match": {"$expr": _is_pos(_GK)}},
+                        {"$sort":  {"stats.sv_pct": -1}},
+                        {"$limit": 1},
+                        {"$project": {
+                            "_id": 0,
+                            "player_name":   1,
+                            "stats.sv_pct":  1,
+                            "stats.gaa":     1,
+                        }},
+                    ],
+
+                    # ── 6c. Paginated data branch ─────────────────────────────
+                    "data": [
+                        {"$sort":  {sort_by: sort_dir}},
+                        {"$skip":  page * page_size},
+                        {"$limit": page_size},
+                        {"$project": {"bio": 0, "birthYearRaw": 0, "source_player_id": 0}},
+                    ],
+
+                    # ── 6d. Cheap total count ─────────────────────────────────
+                    "count": [{"$count": "n"}],
                 }
             }
         ]
 
-        try:
-            metrics_result = list(stats_collection.aggregate(metrics_pipeline))
-            if metrics_result:
-                row = metrics_result[0]
+        facet_result = stats_col.aggregate(facet_pipeline, allowDiskUse=True)
+        row = next(facet_result, {})
 
-                raw_svp = row.get("avgSVP") or 0.0
-                if 0.0 < raw_svp <= 1.0:
-                    raw_svp *= 100.0
+        # ── 7. Unpack facet result ────────────────────────────────────────────
+        total        = (row.get("count") or [{}])[0].get("n", 0)
+        results      = row.get("data", [])
+        m_list       = row.get("metrics") or [{}]
+        m            = m_list[0] if m_list else {}
 
-                f_top = row.get("first_forward") or {}
-                d_top = row.get("first_defense")  or {}
-                g_top = row.get("first_goalie")   or {}
+        fwd_doc = (row.get("topForward") or [{}])[0]
+        def_doc = (row.get("topDefense") or [{}])[0]
+        gk_doc  = (row.get("topGoalie")  or [{}])[0]
 
-                raw_g_svp = g_top.get("svp", 0.0)
-                if 0.0 < raw_g_svp <= 1.0:
-                    raw_g_svp *= 100.0
+        def _svp(raw):
+            """Normalise a save-percentage that may be stored as 0–1 or 0–100."""
+            v = raw or 0.0
+            return round(v * 100.0, 2) if 0.0 < v <= 1.0 else round(v, 2)
 
-                metrics = {
-                    "totalPlayers":    row.get("totalPlayers", 0),
-                    "forwards":        row.get("forwards",     0),
-                    "defensemen":      row.get("defensemen",   0),
-                    "goalies":         row.get("goalies",      0),
-                    "avgGP":           row.get("avgGP")  or 0,
-                    "avgGAA":          row.get("avgGAA") or 0,
-                    "avgSVP":          raw_svp,
-                    "maxPTS":          row.get("maxPTS") or 0,
-                    "leagueCount":     row.get("leagueCount", 0),
-                    "topForwardScorer": f_top.get("name", "—"),
-                    "maxForwardPts":    f_top.get("pts",  0),
-                    "topDefenseScorer": d_top.get("name", "—"),
-                    "maxDefensePts":    d_top.get("pts",  0),
-                    "avgDefenseBlks":   round(row.get("avgDefenseBlks", 0), 1),
-                    "topGoalie":        g_top.get("name", "—"),
-                    "maxGoalieSVP":     raw_g_svp,
-                    "topGoalieGAA":     g_top.get("gaa", 0.0)
-                }
-        except Exception as e:
-            print(f"Metrics aggregation error: {e}")
+        raw_avg_svp = m.get("avgSVP") or 0.0
+        gk_stats    = gk_doc.get("stats") or {}
 
-        # 5. Paginated table data
-        total = metrics["totalPlayers"]
-        pipeline += [
-            {"$sort": {sort_by: sort_dir}},
-            {"$skip": page * page_size},
-            {"$limit": page_size},
-            {"$project": {"bio": 0, "birthYearRaw": 0, "source_player_id": 0}}
-        ]
-        results = list(stats_collection.aggregate(pipeline))
+        metrics = {
+            "totalPlayers":     total,
+            "forwards":         m.get("forwards",     0),
+            "defensemen":       m.get("defensemen",   0),
+            "goalies":          m.get("goalies",      0),
+            "avgGP":            round(m.get("avgGP")  or 0, 1),
+            "avgGAA":           round(m.get("avgGAA") or 0, 2),
+            "avgSVP":           _svp(raw_avg_svp),
+            "maxPTS":           m.get("maxPTS") or 0,
+            "leagueCount":      m.get("leagueCount",  0),
+            "avgDefenseBlks":   round(m.get("avgDefenseBlks") or 0, 1),
+            "topForwardScorer": fwd_doc.get("player_name", "—"),
+            "maxForwardPts":    (fwd_doc.get("stats") or {}).get("pts", 0),
+            "topDefenseScorer": def_doc.get("player_name", "—"),
+            "maxDefensePts":    (def_doc.get("stats") or {}).get("pts", 0),
+            "topGoalie":        gk_doc.get("player_name", "—"),
+            "maxGoalieSVP":     _svp(gk_stats.get("sv_pct", 0)),
+            "topGoalieGAA":     round(gk_stats.get("gaa", 0.0), 2),
+        }
 
         return jsonify_mongo(current_app, {
             "total":    total,
@@ -317,7 +322,7 @@ def get_players():
             "pageSize": page_size,
             "pages":    (total + page_size - 1) // page_size,
             "data":     results,
-            "metrics":  metrics
+            "metrics":  metrics,
         })
 
     except Exception as e:

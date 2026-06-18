@@ -21,7 +21,7 @@ const DEFAULT_PLAYER_FILTERS = {
 };
 
 const DEFAULT_TEAM_FILTERS = {
-  search: '', athlete: '', coach: '', league: '',
+  season: '', search: '', athlete: '', coach: '', league: '',
   page: 0, sortBy: 'team_name', sortDir: 'asc',
 };
 
@@ -78,6 +78,7 @@ export default function App() {
       setError(null);
       try {
         const t = await fetchTeams({
+          season:   teamFilters.season,
           search:   debouncedTeamSearch,
           athlete:  teamFilters.athlete,
           coach:    teamFilters.coach,

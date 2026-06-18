@@ -115,7 +115,11 @@ class PlayerScraper(BaseScraper):
             return 0
 
         player_doc = PlayerDocument.from_jsonld(person_data, team_year, team_id)
-        self.repo.upsert(player_doc.upsert_filter, player_doc.to_dict())
+        # Convert to dictionary and remove the 'year' field if it exists
+        player_dict = player_doc.to_dict()
+        player_dict.pop('year', None)  # 'None' prevents errors if 'year' isn't in the dict
+        # Save the cleaned dictionary
+        self.repo.upsert(player_doc.upsert_filter, player_dict)
         self.log.info("Saved player: %s", name)
         return 1
 
